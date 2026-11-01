@@ -46,34 +46,23 @@ fn run_one(php: &str, file: &Path, id: usize, timeout: Duration) -> Outcome {
     if fs::write(&tmp, code).is_err() {
         return Outcome::Skip;
     }
-    let Ok(mut child) = Command::new(php).arg(&tmp).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+    let outfile = env::temp_dir().join(format!("phpt_{}_{id}.out", std::process::id()));
+    let Ok(out_handle) = fs::File::create(&outfile) else {
         let _ = fs::remove_file(&tmp);
-        return Outcome::Fail;
+        return Outcome::Skip;
     };
-    let start = Instant::now();
-    let mut stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = std::io::Read::read_to_end(s, &mut buf);
-        }
-        buf
-    });
-    let mut timed_out = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                timed_out = true;
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-            Err(_) => break,
-        }
-    }
-    let out = reader.join().unwrap_or_default();
+    let status = Command::new("timeout")
+        .args(["-k", "1", &timeout.as_secs().to_string()])
+        .arg(php)
+        .arg(&tmp)
+        .current_dir(file.parent().unwrap_or(Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_handle))
+        .stderr(Stdio::null())
+        .status();
+    let timed_out = matches!(&status, Ok(s) if s.code() == Some(124) || s.code() == Some(137));
+    let out = fs::read(&outfile).unwrap_or_default();
+    let _ = fs::remove_file(&outfile);
     let _ = fs::remove_file(&tmp);
     let got = String::from_utf8_lossy(&out).replace("\r\n", "\n");
     let ok = match (exact, fmt) {
@@ -84,6 +73,22 @@ fn run_one(php: &str, file: &Path, id: usize, timeout: Duration) -> Outcome {
     if !timed_out && ok {
         Outcome::Pass
     } else {
+        if env::var("PHPT_DIFF").is_ok() {
+            let want = exact.or(fmt).unwrap_or("").trim().to_string();
+            let is_fmt = exact.is_none();
+            let (gl, wl): (Vec<&str>, Vec<&str>) = (got.trim().lines().collect(), want.lines().collect());
+            for i in 0..gl.len().max(wl.len()) {
+                let (g, w) = (gl.get(i).copied().unwrap_or("<EOF>"), wl.get(i).copied().unwrap_or("<EOF>"));
+                let same = if is_fmt { expectf_regex(w).is_some_and(|re| re.is_match(g)) } else { g == w };
+                if !same {
+                    eprintln!("DIFF {} | got: {} | want: {}", file.display(), g.chars().take(80).collect::<String>(), w.chars().take(80).collect::<String>());
+                    break;
+                }
+            }
+            if timed_out {
+                eprintln!("DIFF {} | TIMEOUT", file.display());
+            }
+        }
         Outcome::Fail
     }
 }
