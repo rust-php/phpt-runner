@@ -132,6 +132,9 @@ fn main() {
         std::process::exit(2);
     }
     let list = args.iter().any(|a| a == "--list-failures");
+    let php_abs = fs::canonicalize(&args[1]).map(|p| p.display().to_string()).unwrap_or_else(|_| args[1].clone());
+    let mut args = args;
+    args[1] = php_abs;
     let mut files = vec![];
     walk(Path::new(&args[2]), &mut files);
     files.sort();
